@@ -47,6 +47,29 @@ export function fft(re, im) {
   }
 }
 
+export function frequencyShift(re, im, frequency, sampleRate, firstSample = 0) {
+  const step = (TAU * frequency) / sampleRate,
+    cr = Math.cos(step),
+    ci = Math.sin(step);
+  let c = 1,
+    s = 0;
+  for (let i = 0; i < re.length; i++) {
+    // Re-anchor the oscillator to bound drift over a full six-second capture.
+    if (i % 1024 === 0) {
+      const phase = (TAU * frequency * (firstSample + i)) / sampleRate;
+      c = Math.cos(phase);
+      s = Math.sin(phase);
+    }
+    const a = re[i],
+      b = im[i];
+    re[i] = a * c - b * s;
+    im[i] = a * s + b * c;
+    const next = c * cr - s * ci;
+    s = s * cr + c * ci;
+    c = next;
+  }
+}
+
 function spectrum(re, im, sampleRate, offset) {
   const n = 4096,
     power = new Float64Array(n),
@@ -79,23 +102,28 @@ function spectrum(re, im, sampleRate, offset) {
 
 // 64-tap windowed-sinc fractional resampler, 1024 precomputed phases.
 // Low-pass cutoff .235 cycles/input sample removes energy above output Nyquist.
-function resample(re, im, sampleRate) {
+let resampleTable;
+export function resample(re, im, sampleRate) {
   const half = 32,
     phases = 1024,
     taps = 64,
     cutoff = 0.235;
-  const table = new Float64Array(phases * taps);
-  for (let p = 0; p < phases; p++) {
-    let sum = 0;
-    for (let t = 0; t < taps; t++) {
-      const d = t - half + 1 - p / phases;
-      const sinc = Math.abs(d) < 1e-12 ? 2 * cutoff : Math.sin(TAU * cutoff * d) / (Math.PI * d);
-      const w = 0.42 + 0.5 * Math.cos((Math.PI * d) / half) + 0.08 * Math.cos((TAU * d) / half);
-      table[p * taps + t] = sinc * w;
-      sum += sinc * w;
+  if (!resampleTable) {
+    const table = new Float64Array(phases * taps);
+    for (let p = 0; p < phases; p++) {
+      let sum = 0;
+      for (let t = 0; t < taps; t++) {
+        const d = t - half + 1 - p / phases;
+        const sinc = Math.abs(d) < 1e-12 ? 2 * cutoff : Math.sin(TAU * cutoff * d) / (Math.PI * d);
+        const w = 0.42 + 0.5 * Math.cos((Math.PI * d) / half) + 0.08 * Math.cos((TAU * d) / half);
+        table[p * taps + t] = sinc * w;
+        sum += sinc * w;
+      }
+      for (let t = 0; t < taps; t++) table[p * taps + t] /= sum;
     }
-    for (let t = 0; t < taps; t++) table[p * taps + t] /= sum;
+    resampleTable = table;
   }
+  const table = resampleTable;
   const ratio = sampleRate / ANALYSIS_RATE,
     length = Math.floor(re.length / ratio);
   const r = new Float64Array(length),
@@ -103,16 +131,18 @@ function resample(re, im, sampleRate) {
   for (let i = 0; i < length; i++) {
     const position = i * ratio,
       base = Math.floor(position);
-    const phase = Math.min(phases - 1, Math.floor((position - base) * phases));
+    const phase = Math.min(phases - 1, Math.floor((position - base) * phases)),
+      first = base - half + 1,
+      from = Math.max(0, -first),
+      end = Math.min(taps, re.length - first),
+      coefficient = phase * taps;
     let a = 0,
       b = 0;
-    for (let t = 0; t < taps; t++) {
-      const j = base + t - half + 1;
-      if (j >= 0 && j < re.length) {
-        const h = table[phase * taps + t];
-        a += re[j] * h;
-        b += im[j] * h;
-      }
+    for (let t = from; t < end; t++) {
+      const j = first + t,
+        h = table[coefficient + t];
+      a += re[j] * h;
+      b += im[j] * h;
     }
     r[i] = a;
     q[i] = b;
@@ -144,7 +174,8 @@ export function synchronize(re, im) {
       const a = pr[i + guard] - pr[i],
         b = pi[i + guard] - pi[i];
       const denom = Math.sqrt((e1[i + guard] - e1[i]) * (e2[i + guard] - e2[i]));
-      folded[i % period] += Math.hypot(a, b) / Math.max(1e-15, denom) / blocks;
+      // Input is bounded 8-bit IQ; scaled hypot is unnecessary in this hot loop.
+      folded[i % period] += Math.sqrt(a * a + b * b) / Math.max(1e-15, denom) / blocks;
     }
     let timing = 0;
     for (let i = 1; i < period; i++) if (folded[i] > folded[timing]) timing = i;
@@ -160,15 +191,9 @@ export function synchronize(re, im) {
   const cfo = (Math.atan2(b, a) * ANALYSIS_RATE) / (TAU * n),
     spectra = [];
   for (let start = best.timing + best.guard - 8; start + n <= re.length; start += n + best.guard) {
-    const r = new Float64Array(n),
-      q = new Float64Array(n);
-    for (let i = 0; i < n; i++) {
-      const angle = (-TAU * cfo * (start + i)) / ANALYSIS_RATE,
-        c = Math.cos(angle),
-        s = Math.sin(angle);
-      r[i] = re[start + i] * c - im[start + i] * s;
-      q[i] = re[start + i] * s + im[start + i] * c;
-    }
+    const r = re.slice(start, start + n),
+      q = im.slice(start, start + n);
+    frequencyShift(r, q, -cfo, ANALYSIS_RATE, start);
     fft(r, q);
     spectra.push([r, q]);
   }
@@ -341,15 +366,7 @@ export function analyzeIQ(
     im[i] -= mi;
   }
   const psd = spectrum(re, im, sampleRate, offset);
-  for (let i = 0; i < size; i++) {
-    const phase = (TAU * offset * i) / sampleRate,
-      c = Math.cos(phase),
-      s = Math.sin(phase),
-      a = re[i],
-      b = im[i];
-    re[i] = a * c - b * s;
-    im[i] = a * s + b * c;
-  }
+  frequencyShift(re, im, offset, sampleRate);
   const [r, q] = resample(re, im, sampleRate);
   progress('OFDM synchronization');
   const sync = synchronize(r, q);

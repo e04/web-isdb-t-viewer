@@ -12,6 +12,12 @@ export const PUNCTURE = [
   [1, 1, 0, 1, 1, 0, 0, 1, 1, 0],
   [1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0],
 ];
+const signA = new Int8Array(64),
+  signB = new Int8Array(64);
+for (let i = 0; i < 64; i++) {
+  signA[i] = 1 - 2 * parity(i & 0x4f);
+  signB[i] = 1 - 2 * parity(i & 0x6d);
+}
 // Soft values: positive means bit 0, zero is an erasure.
 export function viterbi(soft, rateIndex = 1, phase = 0) {
   const pattern = PUNCTURE[rateIndex];
@@ -24,30 +30,33 @@ export function viterbi(soft, rateIndex = 1, phase = 0) {
     next = new Float64Array(64),
     input = 0,
     patternIndex = phase;
-  const signA = new Int8Array(128),
-    signB = new Int8Array(128);
-  for (let i = 0; i < 128; i++) {
-    signA[i] = 1 - 2 * parity(i & 0x4f);
-    signB[i] = 1 - 2 * parity(i & 0x6d);
-  }
   let used = 0;
   for (let t = 0; t < steps; t++) {
     const a = pattern[patternIndex++ % pattern.length] ? soft[input++] : 0;
     const b = pattern[patternIndex++ % pattern.length] ? soft[input++] : 0;
     if (input > soft.length) break;
-    let max = -Infinity;
-    for (let state = 0; state < 64; state++) {
-      const lo = state >>> 1,
-        hi = lo + 32;
-      const m0 = old[lo] + a * signA[state] + b * signB[state];
-      const m1 = old[hi] + a * signA[state + 64] + b * signB[state + 64];
-      if (m1 > m0) {
-        next[state] = m1;
-        decisions[t * 8 + (state >>> 3)] |= 1 << (state & 7);
-      } else next[state] = m0;
-      if (next[state] > max) max = next[state];
+    for (let group = 0; group < 8; group++) {
+      let decision = 0;
+      for (let bit = 0; bit < 8; bit++) {
+        const state = group * 8 + bit,
+          lo = state >>> 1,
+          sa = a * signA[state],
+          sb = b * signB[state];
+        // Both generators include bit 6, so the upper predecessor flips both signs.
+        const m0 = old[lo] + sa + sb;
+        const m1 = old[lo + 32] - sa - sb;
+        if (m1 > m0) {
+          next[state] = m1;
+          decision |= 1 << bit;
+        } else next[state] = m0;
+      }
+      decisions[t * 8 + group] = decision;
     }
-    if (t % 256 === 0) for (let i = 0; i < 64; i++) next[i] -= max;
+    if (t % 256 === 0) {
+      let max = -Infinity;
+      for (let i = 0; i < 64; i++) if (next[i] > max) max = next[i];
+      for (let i = 0; i < 64; i++) next[i] -= max;
+    }
     [old, next] = [next, old];
     used++;
   }
