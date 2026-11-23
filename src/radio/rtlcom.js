@@ -175,6 +175,19 @@ export default function RtlCom(conn) {
   }
 
   /**
+   * Drives a GPIO pin of the RTL2832U as an output at the given level.
+   * @param {number} gpio The GPIO pin number.
+   * @param {boolean} on Whether to drive the pin high.
+   */
+  async function setGpioBit(gpio, on) {
+    var bit = 1 << gpio;
+    await writeReg(BLOCK.SYS, REG.GPD, (await readReg(BLOCK.SYS, REG.GPD, 1)) & ~bit, 1);
+    await writeReg(BLOCK.SYS, REG.GPOE, (await readReg(BLOCK.SYS, REG.GPOE, 1)) | bit, 1);
+    var gpo = await readReg(BLOCK.SYS, REG.GPO, 1);
+    await writeReg(BLOCK.SYS, REG.GPO, on ? gpo | bit : gpo & ~bit, 1);
+  }
+
+  /**
    * Decodes a buffer as a little-endian number.
    * @param {ArrayBuffer} buffer The buffer to decode.
    * @returns {number} The decoded number.
@@ -391,6 +404,9 @@ export default function RtlCom(conn) {
     bulk: {
       readBuffer: readBulk,
     },
+    gpio: {
+      setBit: setGpioBit,
+    },
     iface: {
       claim: claimInterface,
       release: releaseInterface,
@@ -427,6 +443,9 @@ var REG = {
   EPA_CTL: 0x2148,
   EPA_MAXPKT: 0x2158,
   DEMOD_CTL: 0x3000,
+  GPO: 0x3001,
+  GPOE: 0x3003,
+  GPD: 0x3004,
   DEMOD_CTL_1: 0x300b,
 };
 

@@ -17,13 +17,30 @@ import RtlCom from './rtlcom.js';
 
 var CMD = RtlCom.CMD;
 
+var I2C_ADDR = { R820T: 0x34, R828D: 0x74 };
+
+var BAND = { HF: 1, VHF: 2, UHF: 3 };
+
 /**
- * Operations on the R820T tuner chip.
+ * Operations on the Rafael Micro R820T/R828D tuner chips.
  * @param {RtlCom} com The RTL communications object.
  * @param {number} xtalFreq The frequency of the oscillator crystal.
+ * @param {{chip?: 'R820T' | 'R828D', blogV4?: boolean}=} opt_variant The tuner chip and
+ *     whether the board is an RTL-SDR Blog V4 (R828D with switched HF/VHF/UHF inputs).
  * @class
  */
-export default function R820T(com, xtalFreq) {
+export default function R820T(com, xtalFreq, opt_variant) {
+  var chip = opt_variant?.chip ?? 'R820T';
+  var blogV4 = chip === 'R828D' && opt_variant?.blogV4 === true;
+  var i2cAddr = I2C_ADDR[chip];
+  var vcoPowerRef = chip === 'R828D' ? 1 : 2;
+
+  /**
+   * The currently selected RF input: a BAND on the Blog V4, a register 0x05 value on
+   * other R828D boards, or null before the first tune.
+   */
+  var input = null;
+
   /**
    * Initial values for registers 0x05-0x1f.
    */
@@ -78,15 +95,49 @@ export default function R820T(com, xtalFreq) {
 
   /**
    * Sets the tuner's frequency.
-   * @param {number} freq The frequency to tune to.
+   * @param {number} freq The LO frequency to tune to (RF plus IF).
+   * @param {number} rfFreq The RF frequency being received, used for input selection.
    * @returns {number} The actual tuned frequency.
    */
-  async function setFrequency(freq) {
+  async function setFrequency(freq, rfFreq) {
     await setMux(freq);
     const actual = await setPll(freq);
     if (!hasPllLock || !Number.isFinite(actual))
       throw new Error('PLL failed to lock. Reconnect and select a channel.');
+    if (blogV4) {
+      await selectBlogV4Input(rfFreq);
+    } else if (chip === 'R828D') {
+      var airCable1In = rfFreq > 345000000 ? 0x00 : 0x60;
+      if (airCable1In !== input) {
+        input = airCable1In;
+        await writeRegMask(0x05, airCable1In, 0x60);
+      }
+    }
     return actual;
+  }
+
+  /**
+   * Applies the RTL-SDR Blog V4 notch filter and HF/VHF/UHF input switching.
+   * Mirrors r82xx_set_freq in the rtlsdrblog/rtl-sdr-blog driver.
+   * @param {number} rfFreq The RF frequency being received.
+   */
+  async function selectBlogV4Input(rfFreq) {
+    var mhz = rfFreq / 1000000;
+    var inNotchBand = mhz <= 2.2 || (mhz >= 85 && mhz <= 112) || (mhz >= 172 && mhz <= 242);
+    await writeRegMask(0x17, inNotchBand ? 0x00 : 0x08, 0x08);
+    var band = mhz <= 28.8 ? BAND.HF : mhz < 250 ? BAND.VHF : BAND.UHF;
+    if (band === BAND.HF) {
+      await writeEach([
+        [0x1a, 0x40, 0xc3],
+        [0x1b, 0x00, 0xff],
+      ]);
+    }
+    if (band === input) return;
+    input = band;
+    await writeRegMask(0x06, band === BAND.HF ? 0x08 : 0x00, 0x08);
+    await com.gpio.setBit(5, band !== BAND.HF);
+    await writeRegMask(0x05, band === BAND.VHF ? 0x40 : 0x00, 0x40);
+    await writeRegMask(0x05, band === BAND.UHF ? 0x00 : 0x20, 0x20);
   }
 
   /**
@@ -249,23 +300,23 @@ export default function R820T(com, xtalFreq) {
     await writeEach([
       [0x10, 0x00, 0x10],
       [0x1a, 0x00, 0x0c],
-      [0x12, 0x80, 0xe0],
+      blogV4 ? [0x12, 0x06, 0xff] : [0x12, 0x80, 0xe0],
     ]);
     var divNum = Math.min(6, Math.floor(Math.log(1770000000 / freq) / Math.LN2));
     var mixDiv = 1 << (divNum + 1);
     var data = await readRegBuffer(0x00, 5);
     var arr = new Uint8Array(data);
     var vcoFineTune = (arr[4] & 0x30) >> 4;
-    if (vcoFineTune > 2) {
+    if (vcoFineTune > vcoPowerRef) {
       --divNum;
-    } else if (vcoFineTune < 2) {
+    } else if (vcoFineTune < vcoPowerRef) {
       ++divNum;
     }
     await writeRegMask(0x10, divNum << 5, 0xe0);
     var vcoFreq = freq * mixDiv;
     var nint = Math.floor(vcoFreq / (2 * pllRef));
     var vcoFra = vcoFreq % (2 * pllRef);
-    if (nint > 63) {
+    if (nint > 128 / vcoPowerRef - 1) {
       hasPllLock = false;
       return;
     }
@@ -298,7 +349,11 @@ export default function R820T(com, xtalFreq) {
       return;
     }
     if (firstTry) {
-      await writeRegMask(0x12, 0x60, 0xe0);
+      if (blogV4) {
+        await writeRegMask(0x12, 0x06, 0xff);
+      } else {
+        await writeRegMask(0x12, 0x60, 0xe0);
+      }
       return await getPllLock(false);
     } else {
       hasPllLock = false;
@@ -314,7 +369,7 @@ export default function R820T(com, xtalFreq) {
     shadowRegs = new Uint8Array(regs);
     var cmds = [];
     for (var i = 0; i < regs.length; ++i) {
-      cmds.push([CMD.I2CREG, 0x34, i + 5, regs[i]]);
+      cmds.push([CMD.I2CREG, i2cAddr, i + 5, regs[i]]);
     }
     await com.writeEach(cmds);
   }
@@ -326,7 +381,7 @@ export default function R820T(com, xtalFreq) {
    * @returns {ArrayBuffer} An ArrayBuffer with the data.
    */
   async function readRegBuffer(addr, length) {
-    var data = await com.i2c.readRegBuffer(0x34, addr, length);
+    var data = await com.i2c.readRegBuffer(i2cAddr, addr, length);
     var buf = new Uint8Array(data);
     for (var i = 0; i < buf.length; ++i) {
       var b = buf[i];
@@ -345,7 +400,7 @@ export default function R820T(com, xtalFreq) {
     var rc = shadowRegs[addr - 5];
     var val = (rc & ~mask) | (value & mask);
     shadowRegs[addr - 5] = val;
-    await com.i2c.writeRegister(0x34, addr, val);
+    await com.i2c.writeRegister(i2cAddr, addr, val);
   }
 
   /**
@@ -369,11 +424,15 @@ export default function R820T(com, xtalFreq) {
 }
 
 /**
- * Checks if the R820T tuner is present.
+ * Probes the I2C bus for an R820T-family tuner.
  * @param {RtlCom} com The RTL communications object.
- * @returns {boolean} A boolean that tells whether the tuner is present.
+ * @returns {'R820T' | 'R828D' | null} The detected chip, or null if none answered.
  */
-R820T.check = async function (com) {
-  var data = await com.i2c.readRegister(0x34, 0);
-  return data == 0x69;
+R820T.probe = async function (com) {
+  for (var chip of ['R820T', 'R828D']) {
+    // An absent I2C address makes the dongle stall the control transfer.
+    var id = await com.i2c.readRegister(I2C_ADDR[chip], 0).catch(() => null);
+    if (id == 0x69) return chip;
+  }
+  return null;
 };

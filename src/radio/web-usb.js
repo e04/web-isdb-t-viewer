@@ -17,6 +17,19 @@ export default function USB(device) {
   this._device = device;
 }
 
+Object.defineProperties(USB.prototype, {
+  manufacturerName: {
+    get() {
+      return this._device.manufacturerName;
+    },
+  },
+  productName: {
+    get() {
+      return this._device.productName;
+    },
+  },
+});
+
 USB.prototype.open = async function () {
   await this._device.open();
 };

@@ -35,6 +35,11 @@ export default function RTL2832U(conn, ppm, opt_gain) {
   var XTAL_FREQ = 28800000;
 
   /**
+   * Crystal of R828D tuners on boards other than the RTL-SDR Blog V4.
+   */
+  var R828D_XTAL_FREQ = 16000000;
+
+  /**
    * Tuner intermediate frequency.
    */
   var IF_FREQ = 3570000;
@@ -108,19 +113,21 @@ export default function RTL2832U(conn, ppm, opt_gain) {
       [CMD.DEMODREG, 0, 0x0d, 0x83, 1],
     ]);
 
-    var xtalFreq = Math.floor(XTAL_FREQ * (1 + ppm / 1000000));
+    var applyPpm = (freq) => Math.floor(freq * (1 + ppm / 1000000));
+    var rtlXtalFreq = applyPpm(XTAL_FREQ);
     await com.i2c.open();
-    var found = await R820T.check(com);
-    if (found) {
-      tuner = new R820T(com, xtalFreq);
-    }
-    if (!tuner) {
+    var chip = await R820T.probe(com);
+    if (!chip) {
       throw new Error(
         'Sorry, your USB dongle has an unsupported tuner chip. ' +
-          'Only the R820T chip is supported.',
+          'Only the R820T/R820T2/R860 and R828D (RTL-SDR Blog V4) chips are supported.',
       );
     }
-    var multiplier = -1 * Math.floor((IF_FREQ * (1 << 22)) / xtalFreq);
+    var blogV4 =
+      chip === 'R828D' && conn.manufacturerName === 'RTLSDRBlog' && conn.productName === 'Blog V4';
+    var tunerXtalFreq = chip === 'R828D' && !blogV4 ? applyPpm(R828D_XTAL_FREQ) : rtlXtalFreq;
+    tuner = new R820T(com, tunerXtalFreq, { chip, blogV4 });
+    var multiplier = -1 * Math.floor((IF_FREQ * (1 << 22)) / rtlXtalFreq);
     await com.writeEach([
       [CMD.DEMODREG, 1, 0xb1, 0x1a, 1],
       [CMD.DEMODREG, 0, 0x08, 0x4d, 1],
@@ -184,7 +191,7 @@ export default function RTL2832U(conn, ppm, opt_gain) {
    */
   async function setCenterFrequency(freq) {
     await com.i2c.open();
-    var actualFreq = await tuner.setFrequency(freq + IF_FREQ);
+    var actualFreq = await tuner.setFrequency(freq + IF_FREQ, freq);
     await com.i2c.close();
     return actualFreq - IF_FREQ;
   }
