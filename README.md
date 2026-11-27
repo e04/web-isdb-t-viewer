@@ -18,4 +18,7 @@ WebUSBを利用してブラウザからRTL-SDRへ直接アクセスし、日本�
 
 ## Acknowledgements
 
+For decoder hot-loop changes, numerical checks, and benchmark instructions, see
+[decoder performance](docs/decoder-performance.md).
+
 This project was developed with reference to the [gr-isdbt](https://github.com/git-artes/gr-isdbt) project, which served as a valuable reference for understanding and implementing ISDB-T signal processing.
